@@ -212,16 +212,69 @@ def _check_quota(
     return result
 
 
+def _check_host_capacity_report(
+    config: Config, compute_client, ad_name: str
+) -> tuple[Optional[str], Optional[int], Optional[str]]:
+    """Check physical host capacity using OCI Compute Capacity Report API.
+
+    Returns (availability_status, available_count, error_msg).
+    Status values: 'AVAILABLE', 'OUT_OF_HOST_CAPACITY', 'HARDWARE_NOT_SUPPORTED', or None.
+    """
+    if not hasattr(compute_client, "create_compute_capacity_report"):
+        return None, None, "compute_client has no create_compute_capacity_report"
+
+    try:
+        report_details = oci.core.models.CreateComputeCapacityReportDetails(
+            compartment_id=config.compartment_id,
+            availability_domain=ad_name,
+            shape_availabilities=[
+                oci.core.models.CreateCapacityReportShapeAvailabilityDetails(
+                    instance_shape=config.shape,
+                    instance_shape_config=oci.core.models.CapacityReportInstanceShapeConfig(
+                        ocpus=config.ocpus,
+                        memory_in_gbs=config.memory_gb,
+                    ),
+                )
+            ],
+        )
+        report = compute_client.create_compute_capacity_report(report_details)
+        if report.data and report.data.shape_availabilities:
+            sa = report.data.shape_availabilities[0]
+            status = getattr(sa, "availability_status", None)
+            count = getattr(sa, "available_count", None)
+            logger.info(
+                "AD %s capacity report: shape=%s status=%s available_count=%s",
+                ad_name,
+                config.shape,
+                status,
+                count,
+            )
+            return status, count, None
+    except Exception as exc:
+        logger.warning(
+            "Capacity report failed for AD %s: %s", ad_name, exc
+        )
+        return None, None, str(exc)
+
+    return None, None, "No data returned in capacity report"
+
+
 def _check_shape_in_ads(
     config: Config,
     compute_client,
     identity_client,
 ) -> dict:
-    """Check if the target shape is listed in any Availability Domain.
+    """Check if the target shape is available on physical hosts in any AD.
+
+    1. Checks if the shape exists in the AD catalog with requested OCPU & RAM.
+    2. Queries the Compute Capacity Report API to verify physical host capacity.
+       - If status == 'AVAILABLE', capacity is confirmed.
+       - If status == 'OUT_OF_HOST_CAPACITY', capacity is full.
 
     Returns dict with keys: shape_found, ad_name, details.
     """
     result = {"shape_found": False, "ad_name": None, "details": ""}
+    last_report_status = None
 
     try:
         ads_resp = identity_client.list_availability_domains(
@@ -254,25 +307,47 @@ def _check_shape_in_ads(
                         <= shape.memory_options.max_in_g_bs
                     )
 
-                if ocpu_ok and mem_ok:
+                if not (ocpu_ok and mem_ok):
+                    continue
+
+                cap_status, cap_count, cap_err = _check_host_capacity_report(
+                    config, compute_client, ad.name
+                )
+                last_report_status = cap_status
+
+                if cap_status == "AVAILABLE":
                     result["shape_found"] = True
                     result["ad_name"] = ad.name
                     result["details"] = (
-                        f"Shape {config.shape} available in AD {ad.name} "
-                        f"(OCPU range: "
-                        f"{getattr(shape.ocpu_options, 'min', 'N/A')}-"
-                        f"{getattr(shape.ocpu_options, 'max', 'N/A')}, "
-                        f"Memory range: "
-                        f"{getattr(shape.memory_options, 'min_in_g_bs', 'N/A')}-"
-                        f"{getattr(shape.memory_options, 'max_in_g_bs', 'N/A')} GB)"
+                        f"Host capacity CONFIRMED available in AD {ad.name} "
+                        f"for shape {config.shape} ({config.ocpus} OCPU, "
+                        f"{config.memory_gb} GB RAM, available count: {cap_count})"
                     )
                     return result
+                elif cap_status == "OUT_OF_HOST_CAPACITY":
+                    result["details"] = (
+                        f"Shape {config.shape} is cataloged in AD {ad.name}, "
+                        f"but host capacity is full (OUT_OF_HOST_CAPACITY). "
+                        f"Notification suppressed."
+                    )
+                elif cap_status is None:
+                    # Capacity report API not available or errored
+                    result["details"] = (
+                        f"Shape {config.shape} found in AD {ad.name}, "
+                        f"but host capacity could not be verified by API: {cap_err}. "
+                        f"Notification suppressed to prevent false positives."
+                    )
+                else:
+                    result["details"] = (
+                        f"AD {ad.name} report status for {config.shape}: {cap_status}"
+                    )
 
-        result["details"] = (
-            f"Shape {config.shape} not found in any AD "
-            f"with requested config ({config.ocpus} OCPU, "
-            f"{config.memory_gb} GB)"
-        )
+        if not result["details"]:
+            result["details"] = (
+                f"Shape {config.shape} not found in any AD "
+                f"with requested config ({config.ocpus} OCPU, "
+                f"{config.memory_gb} GB)"
+            )
     except oci.exceptions.ServiceError as e:
         logger.warning("Shape check ServiceError: %s", e.message)
         raise

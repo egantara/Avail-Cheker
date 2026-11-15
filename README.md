@@ -25,12 +25,12 @@ Monitor ketersediaan **VM.Standard.A1.Flex** di Oracle Cloud region **ap-batam-1
 
 | Status | Arti | Email? |
 |--------|------|--------|
-| `AVAILABLE` | Shape ditemukan di AD + kuota tersedia | ✅ Ya |
-| `QUOTA_ONLY` | Kuota tersedia tapi shape tidak terkonfirmasi di AD mana pun | ❌ Tidak |
-| `UNAVAILABLE` | Kuota habis (OCPU atau RAM) | ❌ Tidak |
+| `AVAILABLE` | Kuota cukup + Host Capacity Report API mengonfirmasi `AVAILABLE` pada server fisik | ✅ Ya |
+| `QUOTA_ONLY` | Kuota cukup, tetapi host capacity penuh (`OUT_OF_HOST_CAPACITY`) atau belum terkonfirmasi | ❌ Tidak |
+| `UNAVAILABLE` | Kuota habis (OCPU atau RAM = 0) | ❌ Tidak |
 | `ERROR` | API error, timeout, atau rate limit | ❌ Tidak |
 
-> **Penting:** Status `QUOTA_ONLY` **tidak pernah** dianggap sebagai kapasitas tersedia. OCI API tidak mengekspos real-time host capacity; listing shape per Availability Domain adalah sinyal terdekat tetapi tidak menjamin launch berhasil.
+> **Pencegahan False Positive:** Checker menggunakan API resmi `create_compute_capacity_report` untuk mengonfirmasi ketersediaan server fisik secara *real-time*. Jika host berstatus `OUT_OF_HOST_CAPACITY`, status akan menjadi `QUOTA_ONLY` dan **email tidak akan dikirim**. Tidak ada VM yang dibuat atau diprovisioning dalam proses ini.
 
 ## Target Default
 

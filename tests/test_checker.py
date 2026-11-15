@@ -62,7 +62,72 @@ def _mock_ad(name):
     return SimpleNamespace(name=name)
 
 
+def _mock_capacity_report(status="AVAILABLE", count=1):
+    """Mock a ComputeCapacityReport response."""
+    entry = SimpleNamespace(
+        instance_shape="VM.Standard.A1.Flex",
+        availability_status=status,
+        available_count=count,
+    )
+    return MagicMock(data=SimpleNamespace(shape_availabilities=[entry]))
+
+
 class TestCheckAvailability(unittest.TestCase):
+    def test_out_of_host_capacity_is_not_available(self):
+        """When capacity report says OUT_OF_HOST_CAPACITY, status must be
+        QUOTA_ONLY or UNAVAILABLE, never AVAILABLE, and no email should fire."""
+        config = _make_config()
+        compute = MagicMock()
+        limits = MagicMock()
+        identity = MagicMock()
+
+        limits.get_resource_availability.side_effect = [
+            _mock_quota_response(4, 0),
+            _mock_quota_response(24, 0),
+        ]
+        identity.list_availability_domains.return_value = MagicMock(
+            data=[_mock_ad("AD-1")]
+        )
+        compute.list_shapes.return_value = MagicMock(
+            data=[_mock_shape("VM.Standard.A1.Flex")]
+        )
+        compute.create_compute_capacity_report.return_value = _mock_capacity_report(
+            status="OUT_OF_HOST_CAPACITY", count=0
+        )
+
+        result = check_availability(config, compute, limits, identity)
+
+        self.assertNotEqual(result.status, STATUS_AVAILABLE)
+        self.assertFalse(result.shape_available)
+        self.assertIn("OUT_OF_HOST_CAPACITY", result.details)
+
+    def test_available_only_when_capacity_report_confirms_available(self):
+        """Capacity report status AVAILABLE confirms host capacity."""
+        config = _make_config()
+        compute = MagicMock()
+        limits = MagicMock()
+        identity = MagicMock()
+
+        limits.get_resource_availability.side_effect = [
+            _mock_quota_response(4, 0),
+            _mock_quota_response(24, 0),
+        ]
+        identity.list_availability_domains.return_value = MagicMock(
+            data=[_mock_ad("AD-1")]
+        )
+        compute.list_shapes.return_value = MagicMock(
+            data=[_mock_shape("VM.Standard.A1.Flex")]
+        )
+        compute.create_compute_capacity_report.return_value = _mock_capacity_report(
+            status="AVAILABLE", count=1
+        )
+
+        result = check_availability(config, compute, limits, identity)
+
+        self.assertEqual(result.status, STATUS_AVAILABLE)
+        self.assertTrue(result.shape_available)
+        self.assertEqual(result.ad_name, "AD-1")
+
     def test_available_when_shape_and_quota(self):
         config = _make_config()
         compute = MagicMock()
@@ -78,6 +143,9 @@ class TestCheckAvailability(unittest.TestCase):
         )
         compute.list_shapes.return_value = MagicMock(
             data=[_mock_shape("VM.Standard.A1.Flex")]
+        )
+        compute.create_compute_capacity_report.return_value = _mock_capacity_report(
+            status="AVAILABLE", count=1
         )
 
         result = check_availability(config, compute, limits, identity)
@@ -194,6 +262,9 @@ class TestCheckAvailability(unittest.TestCase):
         compute.list_shapes.return_value = MagicMock(
             data=[_mock_shape("VM.Standard.A1.Flex")]
         )
+        compute.create_compute_capacity_report.return_value = _mock_capacity_report(
+            status="AVAILABLE", count=1
+        )
 
         result = check_availability(config, compute, limits, identity)
 
@@ -266,6 +337,9 @@ class TestCheckAvailability(unittest.TestCase):
         limits.get_resource_availability.side_effect = quota_side_effect
         compute.list_shapes.return_value = MagicMock(
             data=[_mock_shape("VM.Standard.A1.Flex")]
+        )
+        compute.create_compute_capacity_report.return_value = _mock_capacity_report(
+            status="AVAILABLE", count=1
         )
 
         result = check_availability(config, compute, limits, identity)
