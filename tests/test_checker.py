@@ -35,9 +35,12 @@ def _make_config(**overrides) -> Config:
     return Config(**defaults)
 
 
-def _mock_quota_response(limit_val, used_val):
+def _mock_quota_response(limit_val, used_val, available_val=None):
     """Return a mock OCI response for get_resource_availability."""
+    if available_val is None and limit_val is not None:
+        available_val = limit_val - used_val
     data = SimpleNamespace(
+        available=available_val,
         effective_quota_value=limit_val,
         used=used_val,
     )
@@ -231,6 +234,77 @@ class TestCheckAvailability(unittest.TestCase):
 
         self.assertEqual(result.status, STATUS_UNAVAILABLE)
         self.assertEqual(result.quota_available, 0.0)
+
+    def test_quota_when_effective_quota_value_is_none(self):
+        """When no quota policy exists, effective_quota_value is None.
+        Quota must be read from available/fractional_availability."""
+        config = _make_config()
+        compute = MagicMock()
+        limits = MagicMock()
+        identity = MagicMock()
+
+        identity.list_availability_domains.return_value = MagicMock(
+            data=[_mock_ad("AD-1")]
+        )
+
+        def quota_side_effect(
+            service_name, limit_name, compartment_id,
+            availability_domain=None, **kwargs
+        ):
+            if availability_domain is None:
+                raise oci.exceptions.ServiceError(
+                    status=400,
+                    code="InvalidParameter",
+                    headers={},
+                    message="Invalid parameter 'availabilityDomain'",
+                )
+            if limit_name == "standard-a1-core-count":
+                # effective_quota_value is None, but available=4, used=0
+                return _mock_quota_response(None, 0, available_val=4)
+            return _mock_quota_response(None, 0, available_val=24)
+
+        limits.get_resource_availability.side_effect = quota_side_effect
+        compute.list_shapes.return_value = MagicMock(
+            data=[_mock_shape("VM.Standard.A1.Flex")]
+        )
+
+        result = check_availability(config, compute, limits, identity)
+
+        self.assertEqual(result.status, STATUS_AVAILABLE)
+        self.assertEqual(result.quota_available, 4.0)
+        self.assertEqual(result.memory_quota_available, 24.0)
+
+    def test_unavailable_provides_diagnostic_hint_when_limit_zero(self):
+        config = _make_config()
+        compute = MagicMock()
+        limits = MagicMock()
+        identity = MagicMock()
+
+        identity.list_availability_domains.return_value = MagicMock(
+            data=[_mock_ad("AD-1")]
+        )
+
+        def quota_side_effect(
+            service_name, limit_name, compartment_id,
+            availability_domain=None, **kwargs
+        ):
+            if availability_domain is None:
+                raise oci.exceptions.ServiceError(
+                    status=400,
+                    code="InvalidParameter",
+                    headers={},
+                    message="Invalid parameter 'availabilityDomain'",
+                )
+            return _mock_quota_response(0, 0, available_val=0)
+
+        limits.get_resource_availability.side_effect = quota_side_effect
+        limits.list_limit_values.return_value = MagicMock(data=[])
+
+        result = check_availability(config, compute, limits, identity)
+
+        self.assertEqual(result.status, STATUS_UNAVAILABLE)
+        self.assertIn("Limit is 0", result.details)
+        self.assertIn("Home Region", result.details)
 
     def test_quota_only_without_identity_client(self):
         config = _make_config()

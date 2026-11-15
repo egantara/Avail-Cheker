@@ -71,6 +71,29 @@ def _check_quota(
         "has_quota": False,
     }
 
+    def _parse_availability(data):
+        """Return (available, used, limit) from OCI ResourceAvailability."""
+        fractional_used = getattr(data, "fractional_usage", None)
+        raw_used = fractional_used if fractional_used is not None else getattr(data, "used", None)
+        used = float(raw_used or 0)
+
+        fractional_available = getattr(data, "fractional_availability", None)
+        raw_available = (
+            fractional_available
+            if fractional_available is not None
+            else getattr(data, "available", None)
+        )
+        if raw_available is not None:
+            available = max(float(raw_available), 0.0)
+        elif getattr(data, "effective_quota_value", None) is not None:
+            available = max(float(data.effective_quota_value) - used, 0.0)
+        else:
+            available = 0.0
+
+        effective_limit = getattr(data, "effective_quota_value", None)
+        limit = float(effective_limit) if effective_limit is not None else available + used
+        return available, used, limit
+
     def _query_tenancy_scope():
         ocpu_resp = limits_client.get_resource_availability(
             "compute",
@@ -100,10 +123,7 @@ def _check_quota(
                 config.compartment_id,
                 availability_domain=ad.name,
             )
-            ocpu_data = ocpu_resp.data
-            ad_ocpu_limit = float(ocpu_data.effective_quota_value or 0)
-            ad_ocpu_used = float(ocpu_data.used or 0)
-            ad_ocpu_avail = ad_ocpu_limit - ad_ocpu_used
+            ocpu_avail, ocpu_used, ocpu_limit = _parse_availability(ocpu_resp.data)
 
             mem_resp = limits_client.get_resource_availability(
                 "compute",
@@ -111,17 +131,25 @@ def _check_quota(
                 config.compartment_id,
                 availability_domain=ad.name,
             )
-            mem_data = mem_resp.data
-            ad_mem_limit = float(mem_data.effective_quota_value or 0)
-            ad_mem_used = float(mem_data.used or 0)
-            ad_mem_avail = ad_mem_limit - ad_mem_used
+            mem_avail, mem_used, mem_limit = _parse_availability(mem_resp.data)
 
-            total_ocpu_limit += ad_ocpu_limit
-            total_ocpu_used += ad_ocpu_used
-            total_mem_limit += ad_mem_limit
-            total_mem_used += ad_mem_used
+            logger.info(
+                "AD %s quota: OCPU avail=%s used=%s limit=%s | RAM avail=%s used=%s limit=%s",
+                ad.name,
+                ocpu_avail,
+                ocpu_used,
+                ocpu_limit,
+                mem_avail,
+                mem_used,
+                mem_limit,
+            )
 
-            if ad_ocpu_avail >= config.ocpus and ad_mem_avail >= config.memory_gb:
+            total_ocpu_limit += ocpu_limit
+            total_ocpu_used += ocpu_used
+            total_mem_limit += mem_limit
+            total_mem_used += mem_used
+
+            if ocpu_avail >= config.ocpus and mem_avail >= config.memory_gb:
                 any_ad_has_capacity = True
 
         return (
@@ -135,12 +163,14 @@ def _check_quota(
     try:
         try:
             ocpu_data, mem_data = _query_tenancy_scope()
-            result["ocpu_limit"] = float(ocpu_data.effective_quota_value or 0)
-            result["ocpu_used"] = float(ocpu_data.used or 0)
-            result["ocpu_available"] = result["ocpu_limit"] - result["ocpu_used"]
-            result["mem_limit"] = float(mem_data.effective_quota_value or 0)
-            result["mem_used"] = float(mem_data.used or 0)
-            result["mem_available"] = result["mem_limit"] - result["mem_used"]
+            ocpu_avail, ocpu_used, ocpu_limit = _parse_availability(ocpu_data)
+            mem_avail, mem_used, mem_limit = _parse_availability(mem_data)
+            result["ocpu_limit"] = ocpu_limit
+            result["ocpu_used"] = ocpu_used
+            result["ocpu_available"] = ocpu_avail
+            result["mem_limit"] = mem_limit
+            result["mem_used"] = mem_used
+            result["mem_available"] = mem_avail
             result["has_quota"] = (
                 result["ocpu_available"] >= config.ocpus
                 and result["mem_available"] >= config.memory_gb
@@ -204,6 +234,7 @@ def _check_shape_in_ads(
                 config.compartment_id,
                 availability_domain=ad.name,
             )
+            logger.info("AD %s: scanned %d shapes", ad.name, len(shapes_resp.data))
             for shape in shapes_resp.data:
                 if shape.shape != config.shape:
                     continue
@@ -291,6 +322,13 @@ def check_availability(
         )
 
     if not quota["has_quota"]:
+        limit_hint = ""
+        if quota.get("ocpu_limit") == 0.0:
+            limit_hint = (
+                f" (Limit is 0: verify OCI_COMPARTMENT_ID is the Root Tenancy OCID, "
+                f"or check Service Limits in Console for region '{config.region}'. "
+                f"Always Free A1 resources are only in your Home Region)"
+            )
         return CheckResult(
             status=STATUS_UNAVAILABLE,
             timestamp=timestamp,
@@ -306,7 +344,7 @@ def check_availability(
                 f"{quota['ocpu_available']} OCPU available "
                 f"(need {config.ocpus}), "
                 f"{quota['mem_available']} GB RAM available "
-                f"(need {config.memory_gb})"
+                f"(need {config.memory_gb}){limit_hint}"
             ),
         )
 
