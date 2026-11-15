@@ -160,6 +160,78 @@ class TestCheckAvailability(unittest.TestCase):
         self.assertIn("429", result.details)
         self.assertIn("Rate limit", result.details)
 
+    def test_quota_falls_back_to_ad_scope(self):
+        """A1 limits are AD-scoped: tenancy scope returns 400, so quota
+        must be fetched per Availability Domain and aggregated."""
+        config = _make_config()
+        compute = MagicMock()
+        limits = MagicMock()
+        identity = MagicMock()
+
+        identity.list_availability_domains.return_value = MagicMock(
+            data=[_mock_ad("AD-1"), _mock_ad("AD-2")]
+        )
+
+        def quota_side_effect(
+            service_name, limit_name, compartment_id,
+            availability_domain=None, **kwargs
+        ):
+            if availability_domain is None:
+                raise oci.exceptions.ServiceError(
+                    status=400,
+                    code="InvalidParameter",
+                    headers={},
+                    message="Invalid parameter 'availabilityDomain'",
+                )
+            if limit_name == "standard-a1-core-count":
+                return _mock_quota_response(4, 1)
+            return _mock_quota_response(24, 6)
+
+        limits.get_resource_availability.side_effect = quota_side_effect
+        compute.list_shapes.return_value = MagicMock(
+            data=[_mock_shape("VM.Standard.A1.Flex")]
+        )
+
+        result = check_availability(config, compute, limits, identity)
+
+        self.assertEqual(result.status, STATUS_AVAILABLE)
+        self.assertEqual(result.quota_available, 6.0)
+        self.assertEqual(result.quota_used, 2.0)
+        self.assertEqual(result.memory_quota_available, 36.0)
+
+    def test_ad_scoped_quota_exhausted_is_unavailable(self):
+        """AD-scoped aggregation must still detect exhausted quota."""
+        config = _make_config()
+        compute = MagicMock()
+        limits = MagicMock()
+        identity = MagicMock()
+
+        identity.list_availability_domains.return_value = MagicMock(
+            data=[_mock_ad("AD-1")]
+        )
+
+        def quota_side_effect(
+            service_name, limit_name, compartment_id,
+            availability_domain=None, **kwargs
+        ):
+            if availability_domain is None:
+                raise oci.exceptions.ServiceError(
+                    status=400,
+                    code="InvalidParameter",
+                    headers={},
+                    message="Invalid parameter 'availabilityDomain'",
+                )
+            if limit_name == "standard-a1-core-count":
+                return _mock_quota_response(4, 4)
+            return _mock_quota_response(24, 24)
+
+        limits.get_resource_availability.side_effect = quota_side_effect
+
+        result = check_availability(config, compute, limits, identity)
+
+        self.assertEqual(result.status, STATUS_UNAVAILABLE)
+        self.assertEqual(result.quota_available, 0.0)
+
     def test_quota_only_without_identity_client(self):
         config = _make_config()
         compute = MagicMock()

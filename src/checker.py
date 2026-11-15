@@ -50,9 +50,13 @@ def _now_iso() -> str:
 def _check_quota(
     config: Config,
     limits_client,
-    tenancy_id: str,
+    identity_client=None,
 ) -> dict:
     """Check OCPU and memory quota for A1 shapes.
+
+    Tries region/compartment scope first. If the API returns 400
+    indicating availabilityDomain is required (AD-scoped limits),
+    queries each Availability Domain and aggregates.
 
     Returns dict with keys: ocpu_available, ocpu_used, ocpu_limit,
     mem_available, mem_used, mem_limit, has_quota.
@@ -67,33 +71,107 @@ def _check_quota(
         "has_quota": False,
     }
 
-    try:
+    def _query_tenancy_scope():
         ocpu_resp = limits_client.get_resource_availability(
             "compute",
             "standard-a1-core-count",
             config.compartment_id,
-            availability_domain=None,
         )
         ocpu_data = ocpu_resp.data
-        result["ocpu_limit"] = float(ocpu_data.effective_quota_value or 0)
-        result["ocpu_used"] = float(ocpu_data.used or 0)
-        result["ocpu_available"] = result["ocpu_limit"] - result["ocpu_used"]
-
         mem_resp = limits_client.get_resource_availability(
             "compute",
             "standard-a1-memory-count",
             config.compartment_id,
-            availability_domain=None,
         )
         mem_data = mem_resp.data
-        result["mem_limit"] = float(mem_data.effective_quota_value or 0)
-        result["mem_used"] = float(mem_data.used or 0)
-        result["mem_available"] = result["mem_limit"] - result["mem_used"]
+        return ocpu_data, mem_data
 
-        result["has_quota"] = (
-            result["ocpu_available"] >= config.ocpus
-            and result["mem_available"] >= config.memory_gb
+    def _query_ad_scope(ads):
+        total_ocpu_limit = 0.0
+        total_ocpu_used = 0.0
+        total_mem_limit = 0.0
+        total_mem_used = 0.0
+        any_ad_has_capacity = False
+
+        for ad in ads:
+            ocpu_resp = limits_client.get_resource_availability(
+                "compute",
+                "standard-a1-core-count",
+                config.compartment_id,
+                availability_domain=ad.name,
+            )
+            ocpu_data = ocpu_resp.data
+            ad_ocpu_limit = float(ocpu_data.effective_quota_value or 0)
+            ad_ocpu_used = float(ocpu_data.used or 0)
+            ad_ocpu_avail = ad_ocpu_limit - ad_ocpu_used
+
+            mem_resp = limits_client.get_resource_availability(
+                "compute",
+                "standard-a1-memory-count",
+                config.compartment_id,
+                availability_domain=ad.name,
+            )
+            mem_data = mem_resp.data
+            ad_mem_limit = float(mem_data.effective_quota_value or 0)
+            ad_mem_used = float(mem_data.used or 0)
+            ad_mem_avail = ad_mem_limit - ad_mem_used
+
+            total_ocpu_limit += ad_ocpu_limit
+            total_ocpu_used += ad_ocpu_used
+            total_mem_limit += ad_mem_limit
+            total_mem_used += ad_mem_used
+
+            if ad_ocpu_avail >= config.ocpus and ad_mem_avail >= config.memory_gb:
+                any_ad_has_capacity = True
+
+        return (
+            total_ocpu_limit,
+            total_ocpu_used,
+            total_mem_limit,
+            total_mem_used,
+            any_ad_has_capacity,
         )
+
+    try:
+        try:
+            ocpu_data, mem_data = _query_tenancy_scope()
+            result["ocpu_limit"] = float(ocpu_data.effective_quota_value or 0)
+            result["ocpu_used"] = float(ocpu_data.used or 0)
+            result["ocpu_available"] = result["ocpu_limit"] - result["ocpu_used"]
+            result["mem_limit"] = float(mem_data.effective_quota_value or 0)
+            result["mem_used"] = float(mem_data.used or 0)
+            result["mem_available"] = result["mem_limit"] - result["mem_used"]
+            result["has_quota"] = (
+                result["ocpu_available"] >= config.ocpus
+                and result["mem_available"] >= config.memory_gb
+            )
+        except oci.exceptions.ServiceError as e:
+            is_ad_scoped = (
+                e.status == 400
+                and "availabilityDomain" in str(e.message or "")
+            )
+            if not is_ad_scoped or identity_client is None:
+                raise
+
+            ads_resp = identity_client.list_availability_domains(
+                config.compartment_id
+            )
+            (
+                ocpu_limit,
+                ocpu_used,
+                mem_limit,
+                mem_used,
+                has_quota,
+            ) = _query_ad_scope(ads_resp.data)
+
+            result["ocpu_limit"] = ocpu_limit
+            result["ocpu_used"] = ocpu_used
+            result["ocpu_available"] = ocpu_limit - ocpu_used
+            result["mem_limit"] = mem_limit
+            result["mem_used"] = mem_used
+            result["mem_available"] = mem_limit - mem_used
+            result["has_quota"] = has_quota
+
     except oci.exceptions.ServiceError as e:
         logger.warning("Quota check ServiceError: %s", e.message)
         raise
@@ -194,7 +272,7 @@ def check_availability(
     timestamp = _now_iso()
 
     try:
-        quota = _check_quota(config, limits_client, config.compartment_id)
+        quota = _check_quota(config, limits_client, identity_client)
     except oci.exceptions.ServiceError as e:
         status = STATUS_ERROR
         details = f"Quota API error (HTTP {e.status}): {e.message}"
